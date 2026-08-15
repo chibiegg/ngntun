@@ -1,0 +1,53 @@
+[Unit]
+# ngntun 用の DHCPv6-PD クライアント。インスタンス名が対象のインタフェース名。
+#
+#   sudo install -m 644 scripts/ngntun-dhclient6@.service /etc/systemd/system/
+#   sudo install -m 755 scripts/50-ngntun /etc/NetworkManager/dispatcher.d/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ngntun-dhclient6@eth1.service
+#
+# NetworkManager 管理下のインタフェースでは、dispatcher (50-ngntun) を必ず併せて入れること。
+# NM は接続をアクティベートするたびに、自分の管理外であるこのアドレスを消す。dhclient は
+# 生き続けたまま「付けた」と記録しているので自力では復旧せず、Restart= でも検知できない。
+# dispatcher から up / reapply のたびに起動し直すことで、初めて辻褄が合う。
+Description=ngntun DHCPv6-PD client on %I
+Documentation=https://github.com/chibiegg/ngntun
+
+# デバイスが現れてから起動し、消えたら止まる。名前が udev で決まる前に走り出して
+# 失敗するのを防ぐ。
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# dhclient -6 は起動時にリンクローカルアドレスへ bind する。DAD が終わる前に走ると
+#   Can't bind to dhcp address: Cannot assign requested address
+# で即座に終了する。network-online.target だけでは足りないので、ここで待つ。
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ip -6 addr show dev %i scope link -tentative | grep -q inet6 && exit 0; sleep 1; done; echo "%i のリンクローカルアドレスが立ちません" >&2; exit 1'
+
+# -d でフォアグラウンドに留める (Type=simple に合わせる)。
+ExecStart=/usr/sbin/dhclient -6 -P -d \
+  -cf /etc/ngntun/dhclient6.conf \
+  -sf /usr/local/sbin/ngntun-dhclient-script \
+  -lf /var/lib/dhcp/ngntun6-%i.leases \
+  -pf /run/ngntun-d6-%i.pid \
+  %i
+
+# 停止時は -r (Release) で止める。スクリプトが RELEASE6 で呼ばれ、付けた送信元アドレスが
+# 片づく。-x (単に停止) ではスクリプトが呼ばれず、アドレスが残ったままになるので使わない。
+# 失効したプレフィックスのアドレスが残っていると、HGW は INVITE をエラーも返さず捨てる。
+ExecStop=/usr/sbin/dhclient -6 -P -r \
+  -cf /etc/ngntun/dhclient6.conf \
+  -sf /usr/local/sbin/ngntun-dhclient-script \
+  -lf /var/lib/dhcp/ngntun6-%i.leases \
+  -pf /run/ngntun-d6-%i.pid \
+  %i
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

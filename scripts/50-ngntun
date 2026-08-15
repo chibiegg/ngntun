@@ -1,0 +1,38 @@
+#!/bin/sh
+# NetworkManager の dispatcher スクリプト。
+#
+# 設置先: /etc/NetworkManager/dispatcher.d/50-ngntun
+#   sudo install -m 755 -o root -g root scripts/50-ngntun /etc/NetworkManager/dispatcher.d/
+#
+# NetworkManager がインタフェースを up にした「後」に呼ばれるので、起動順の調整では
+# 解けない次の 2 つが同時に片づく。
+#
+#   1. NM がインタフェースを設定し終わる前に dhclient が走ってしまい、Solicit を取りこぼす
+#   2. dhclient が付けた送信元アドレスを、後から来た NM の再設定が消してしまう
+#
+# NM が接続を上げ直すたびに DHCPv6-PD を取り直すので、どちらの順序でも辻褄が合う。
+#
+# 対象のインタフェースは NGNTUN_IFACE で環境から渡すか、下の既定値を書き換える。
+
+set -u
+
+IFACE="$1"
+ACTION="$2"
+
+TARGET="${NGNTUN_IFACE:-eth1}"
+
+[ "$IFACE" = "$TARGET" ] || exit 0
+
+case "$ACTION" in
+up | reapply)
+	# reapply も拾う。nmcli device reapply はインタフェースを落とさないまま
+	# 管理外のアドレスだけを消していくので、up だけ見ていると取りこぼす。
+	# --no-block: dispatcher はタイムアウト付きで実行されるので、待たずに投げる。
+	systemctl restart --no-block "ngntun-dhclient6@${IFACE}.service"
+	;;
+down)
+	systemctl stop --no-block "ngntun-dhclient6@${IFACE}.service"
+	;;
+esac
+
+exit 0

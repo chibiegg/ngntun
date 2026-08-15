@@ -1,0 +1,175 @@
+#!/bin/sh
+# ngntun 用の dhclient スクリプト。dhclient の -sf で指定する。
+#
+# 設置先の例: /usr/local/sbin/ngntun-dhclient-script (実行権限を付けること)
+#
+# 【重要】このスクリプトは経路に一切触らない。行うのはリース情報の JSON 書き出しと、委譲プレフィックスからの送信元アドレスの付与だけ。
+#
+# 通常の dhclient-script はデフォルトゲートウェイを書き換えてしまうため、既にインターネット側の経路を持つ機器で走らせると疎通が切れる。
+#
+# 送信元アドレスは委譲プレフィックスの先頭 /64 に EUI-64 で付け、プレフィックスが変わったときは古いアドレスを消してから付け直す。失効した委譲プレフィックスを送信元にすると HGW は INVITE をエラーも返さず捨てるので、古いアドレスを残さないことが重要になる。アドレスの付与が不要なら NGNTUN_SKIP_ADDR=1 を環境に置く。
+#
+# ベンダオプションの TLV 解析は ngntun 側で行う。シェルに解析ロジックを持たせるとデバッグできなくなるため。
+
+set -u
+
+dir=/run/ngntun
+state=$dir/source-addr6 # 直近に付けた送信元アドレスと、その付与先
+mkdir -p "$dir"
+
+# 変数名の実測やトラブルシュートのために、環境変数を丸ごと残しておく。
+env | sort > "$dir/env-${reason:-unknown}.txt"
+
+write_json() {
+	tmp="$1.tmp"
+	cat > "$tmp"
+	mv "$tmp" "$1" # 読み手が中途半端な内容を見ないよう原子的に差し替える
+}
+
+# count_groups はコロン区切りの空でないグループ数を返す。
+count_groups() {
+	_old_ifs=$IFS
+	IFS=:
+	# shellcheck disable=SC2086 # コロンで分割させるための意図的な非クォート
+	set -- $1
+	IFS=$_old_ifs
+	_n=0
+	for _g in "$@"; do
+		[ -n "$_g" ] && _n=$((_n + 1))
+	done
+	echo "$_n"
+}
+
+# expand6 は "::" を 0 で埋めて 8 グループの完全形にする。先頭 /64 を取り出すために、グループ境界を確定させる必要がある。
+expand6() {
+	case "$1" in
+	*::*)
+		_left=${1%%::*}
+		_right=${1#*::}
+		_n=$(($(count_groups "$_left") + $(count_groups "$_right")))
+		_zeros=
+		while [ "$_n" -lt 8 ]; do
+			_zeros="$_zeros:0"
+			_n=$((_n + 1))
+		done
+		_out="${_left}${_zeros}"
+		[ -n "$_right" ] && _out="$_out:$_right"
+		echo "${_out#:}"
+		;;
+	*)
+		echo "$1"
+		;;
+	esac
+}
+
+# eui64_addr は委譲プレフィックスとインタフェースの MAC から送信元アドレスを組み立てる。
+# 例: 240b:10:dd83:c920::/60 + a0:ce:c8:cf:1d:ae
+#     -> 240b:10:dd83:c920:a2ce:c8ff:fecf:1dae/64
+eui64_addr() {
+	_prefix=${1:-}
+	[ -n "$_prefix" ] || return 1
+	[ -n "${interface:-}" ] || return 1
+
+	_mac=$(cat "/sys/class/net/$interface/address" 2>/dev/null) || return 1
+	_old_ifs=$IFS
+	IFS=:
+	# shellcheck disable=SC2086
+	set -- $_mac
+	IFS=$_old_ifs
+	[ $# -eq 6 ] || return 1
+	# EUI-64 は先頭オクテットの U/L ビットを反転し、中央に ff:fe を挟む。
+	_b1=$(printf '%02x' $((0x$1 ^ 0x02))) || return 1
+	_iid="${_b1}${2}:${3}ff:fe${4}:${5}${6}"
+
+	_old_ifs=$IFS
+	IFS=:
+	# shellcheck disable=SC2046 # コロンで分割させるための意図的な非クォート
+	set -- $(expand6 "${_prefix%%/*}")
+	IFS=$_old_ifs
+	[ $# -eq 8 ] || return 1
+
+	echo "${1}:${2}:${3}:${4}:${_iid}/64"
+}
+
+# 送信元アドレスを委譲プレフィックスに追従させる。
+sync_addr() {
+	case "${NGNTUN_SKIP_ADDR:-}" in
+	"" | 0 | no | off) ;;
+	*) return 0 ;;
+	esac
+
+	_new=$(eui64_addr "${new_ip6_prefix:-}") || _new=
+
+	# 前回付けたアドレスを記録しておき、変わっていれば消す。dhclient を起動し直すと old_ip6_prefix が渡ってこないので、これがないと失効したプレフィックスのアドレスが残ってしまう。
+	if [ -r "$state" ]; then
+		read -r _prev _prev_if < "$state"
+		if [ -n "${_prev:-}" ] && [ "$_prev" != "$_new" ]; then
+			ip -6 addr del "$_prev" dev "${_prev_if:-$interface}" 2>/dev/null
+			rm -f "$state"
+		fi
+	fi
+
+	[ -n "$_new" ] || return 0
+	# replace なので既に付いていても失敗しない。
+	ip -6 addr replace "$_new" dev "$interface" nodad || return 0
+	echo "$_new $interface" > "$state"
+}
+
+case "${reason:-}" in
+BOUND6 | RENEW6 | REBIND6 | REBOOT6)
+	write_json "$dir/lease6.json" <<-EOF
+		{
+		  "reason": "$reason",
+		  "interface": "${interface:-}",
+		  "ip6_address": "${new_ip6_address:-}",
+		  "ip6_prefix": "${new_ip6_prefix:-}",
+		  "sip_servers_addresses": "${new_dhcp6_sip_servers_addresses:-}",
+		  "sip_servers_names": "${new_dhcp6_sip_servers_names:-}",
+		  "vendor_opts": "${new_dhcp6_vendor_opts:-}",
+		  "domain_search": "${new_dhcp6_domain_search:-}",
+		  "name_servers": "${new_dhcp6_name_servers:-}"
+		}
+	EOF
+	sync_addr
+	;;
+
+DEPREF6 | EXPIRE6)
+	# 使えなくなった委譲プレフィックスのアドレスは残さない。DEPREF6 (推奨されなくなっただけで有効期限内) も対象にしてある。消しておけば ngntun は「委譲プレフィックス内のアドレスが無い」と明示的に失敗する。残したまま発信すると HGW が INVITE をエラーも返さず捨てるので、そちらのほうが厄介。
+	#
+	# ただし【失効したのが今使っているプレフィックスのときだけ】消す。リース DB に古いリースが残っていると、そちらの失効が現行のアドレスを巻き添えにしてしまう (BOUND6 の直後に別プレフィックスの EXPIRE6 が来る形で踏んだ)。
+	_gone=$(eui64_addr "${old_ip6_prefix:-}") || _gone=
+	if [ -n "$_gone" ] && [ -r "$state" ]; then
+		read -r _prev _prev_if < "$state"
+		if [ "${_prev:-}" = "$_gone" ]; then
+			ip -6 addr del "$_prev" dev "${_prev_if:-$interface}" 2>/dev/null
+			rm -f "$state"
+		fi
+	fi
+	;;
+
+RELEASE6 | STOP6)
+	# クライアント自体が終わるので、記録してあるアドレスは無条件に片づける。
+	if [ -r "$state" ]; then
+		read -r _prev _prev_if < "$state"
+		if [ -n "${_prev:-}" ]; then
+			ip -6 addr del "$_prev" dev "${_prev_if:-$interface}" 2>/dev/null
+		fi
+		rm -f "$state"
+	fi
+	;;
+
+BOUND | RENEW | REBIND | REBOOT)
+	write_json "$dir/lease4.json" <<-EOF
+		{
+		  "reason": "$reason",
+		  "interface": "${interface:-}",
+		  "ip_address": "${new_ip_address:-}",
+		  "subnet_mask": "${new_subnet_mask:-}",
+		  "routers": "${new_routers:-}",
+		  "domain_name_servers": "${new_domain_name_servers:-}"
+		}
+	EOF
+	;;
+esac
+
+exit 0

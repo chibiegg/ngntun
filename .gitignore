@@ -1,0 +1,15 @@
+# ビルド成果物
+/ngntun
+/ngntun-*
+*.test
+*.out
+
+# 実験中に手元へ落としたキャプチャやログ
+*.pcap
+*.pcapng
+*.log
+
+# エディタ・OS
+.DS_Store
+.idea/
+.vscode/
